@@ -1,0 +1,113 @@
+# The GCC toolchain is stored in the GitHub Actions cache after being built. To
+# minimize build times, the toolchain build step is skipped if there is a cached
+# copy of the toolchain that has not expired.
+
+name: Build
+on:   [ push, pull_request ]
+
+jobs:
+  build:
+    name:    Run build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+    - name: Initialize toolchain cache
+      id:   cache
+      uses: actions/cache@v5
+      with:
+        key:  toolchain
+        path: gcc-mipsel-none-elf
+
+    - name: Fetch repo contents
+      uses: actions/checkout@v6
+      with:
+        path: PSX-iTests
+
+    - name: Fix script permissions
+      run: |
+        chmod +x PSX-iTests/.github/scripts/*.sh
+
+    - name: Install prerequisites
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y --no-install-recommends ninja-build mame-tools
+
+    - name: Download mkpsxiso
+      run: |
+        python3 -c "
+        import json, urllib.request
+        req = urllib.request.Request(
+            'https://api.github.com/repos/Lameguy64/mkpsxiso/releases/latest',
+            headers={'User-Agent': 'psx-itests-ci'}
+        )
+        with urllib.request.urlopen(req) as r:
+            data = json.load(r)
+        url = None
+        for asset in data['assets']:
+            name = asset['name'].lower()
+            if ('ubuntu' in name or 'linux' in name) and not name.endswith('.sha256'):
+                url = asset['browser_download_url']
+                break
+        if not url:
+            raise SystemExit('No Linux mkpsxiso release asset found')
+        print('Downloading:', url)
+        urllib.request.urlretrieve(url, 'mkpsxiso-package')
+        "
+        echo "--- Downloaded package info ---"
+        file mkpsxiso-package
+        mkdir -p mkpsxiso-bin
+        if file mkpsxiso-package | grep -qi "Debian binary package"; then
+          echo "Detected a .deb package - extracting with dpkg -x"
+          dpkg -x mkpsxiso-package mkpsxiso-bin
+        elif unzip -o mkpsxiso-package -d mkpsxiso-bin; then
+          echo "Detected a zip archive"
+        else
+          echo "Falling back to tar"
+          tar -xf mkpsxiso-package -C mkpsxiso-bin
+        fi
+        echo "--- Extracted contents ---"
+        find mkpsxiso-bin -type f
+        MKPSXISO_BIN="$(find mkpsxiso-bin -type f -iname 'mkpsxiso' | head -n 1)"
+        if [ -z "$MKPSXISO_BIN" ]; then
+          echo "Could not locate an 'mkpsxiso' binary in the downloaded package" >&2
+          exit 1
+        fi
+        echo "Found: $MKPSXISO_BIN"
+        chmod +x "$MKPSXISO_BIN"
+        sudo cp "$MKPSXISO_BIN" /usr/local/bin/mkpsxiso
+        sudo chmod +x /usr/local/bin/mkpsxiso
+        echo "--- Verifying installation ---"
+        which mkpsxiso
+        mkpsxiso --version || mkpsxiso -h || true
+
+    - name: Set up Python virtual environment
+      run: |
+        python3 -m venv PSX-iTests/env
+        source PSX-iTests/env/bin/activate
+        pip3 install -r PSX-iTests/tools/requirements.txt
+
+    - name: Build GCC toolchain
+      if:   ${{ steps.cache.outputs.cache-hit != 'true' }}
+      run: |
+        bash PSX-iTests/.github/scripts/buildToolchain.sh gcc-mipsel-none-elf mipsel-none-elf
+
+    - name: Build project
+      run: |
+        bash PSX-iTests/.github/scripts/buildRelease.sh
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v7
+      with:
+        name:              build
+        if-no-files-found: error
+        path:              PSX-iTests-*.zip
+
+    - name: Publish release
+      if:   ${{ github.ref_type == 'tag' }}
+      uses: softprops/action-gh-release@v3
+      with:
+        fail_on_unmatched_files: true
+        files:                   PSX-iTests-*.zip
